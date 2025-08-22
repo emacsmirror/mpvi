@@ -2028,6 +2028,7 @@ ARG is the argument."
 ;;; Miscellaneous
 
 (require 'mpvi-subtitle)
+(require 'mpvi-living)
 (require 'mpvi-bilibili)
 
 (mpvi-emms-integrated-mode t)
