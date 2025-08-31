@@ -272,6 +272,30 @@ VERSION should be a list, like \\='(0 38 0) representing version 0.38.0."
              (+ (* (car current) 1000000) (* (cadr current) 1000) (caddr current))
              (+ (* (car version) 1000000) (* (cadr version) 1000) (caddr version)))))
 
+(defvar-local mpvi-transient-buffer-status nil)
+
+(cl-defun mpvi-transient-buffer (buffer &key title tips content keymap onload wconfig)
+  "Pop to BUFFER for transient task.
+TITLE and TIPS is shown with header line.
+CONTENT is the initial text of the buffer.
+KEYMAP is a key map used as the local map.
+ONLOAD is a function to execute after buffer ready.
+WCONFIG is a list as window popup action."
+  (declare (indent 1))
+  (with-current-buffer (if (bufferp buffer) buffer (get-buffer-create buffer))
+    (let* ((inhibit-read-only t)
+           (tip (if tips (mapconcat #'identity tips "  ")))
+           (hline (list (propertize " " 'display '(space :width 0.6)) title
+                        '(:eval (if mpvi-transient-buffer-status (concat "   " mpvi-transient-buffer-status)))
+                        (if tip (propertize " " 'display `((space :align-to (- right ,(length tip)))))) tip)))
+      (erase-buffer)
+      (setq header-line-format hline)
+      (insert content)
+      (if keymap (use-local-map keymap))
+      (if onload (funcall onload))
+      (set-buffer-modified-p nil)
+      (pop-to-buffer (current-buffer) wconfig))))
+
 
 ;;; MPV communication
 
@@ -1076,7 +1100,7 @@ OPTS is a string, pass to `ffmpeg' when it is not nil."
                                             (if (file-exists-p target)
                                                 (message
                                                  (propertize
-                                                  (format "Output file %s is already exist!" target)
+                                                  (format "output file %s is already exist!" target)
                                                   'face 'font-lock-warning-face))
                                               (exit-minibuffer))))))
                      (read-string "Confirm: "
@@ -1110,6 +1134,27 @@ A complex example:
 
 Meaning of `bv*+ba/b' is:
   merge the best video with best audio-only, or return the best merged.")
+
+(defvar mpvi-ytdl-option-tpls
+  (list "-t mp3|mp4"
+        "-f bv*+ba/b"
+        "-o %(title)s.%(ext)s"
+        "-o %(playlist_index)s - %(title)s.%(ext)s"
+        "--match-filters like_count>?100"
+        "--continue"
+        "--concurrent-fragments 2"
+        "--proxy http://127.0.0.1:1080"
+        "--downloader aria2c"
+        "--downloader-args ffmpeg:-ss 0"
+        "--downloader ffmpeg --downloader-args \"ffmpeg:-ss 0 -to 0\""
+        "--cookies-from-browser edge"
+        "--write-description"
+        "--write-subs"
+        "--convert-subs ass|srt|none"
+        "--embed-subs"
+        "--embed-thumbnail"
+        "--embed-metadata"
+        "--embed-chapters"))
 
 (defun mpvi-ytdl-dump-url (url)
   "Return metadata of video URL."
@@ -1166,60 +1211,100 @@ FIELD can be id/title/urls/description/format/thumbnail/formats_table and so on.
   (cl-assert (mpvi-url-p url))
   (unless (and (executable-find "yt-dlp") (executable-find "ffmpeg"))
     (user-error "Programs `yt-dlp' and `ffmpeg' should be installed"))
-  (let* ((fmts (mpvi-ytdl-pick-formats url))
-         (target (if target
-                     (expand-file-name target)
-                   (let* ((meta (mpvi-ytdl-dump-url url))
-                          (title (alist-get 'title meta))
-                          (ext (or (and (= 1 (length fmts))
-                                        (alist-get 'ext (cl-find-if (lambda (c) (equal (alist-get 'format_id c) (car fmts)))
-                                                                    (alist-get 'formats meta))))
-                                   (alist-get 'ext meta)
-                                   "mp4")))
-                     (expand-file-name (thread-last
-                                         (format "%s_%s.%s" title (string-join fmts "+") ext)
-                                         (string-replace "/" "-"))
-                                       mpvi-last-save-directory))))
+  (let* ((meta (mpvi-ytdl-dump-url url))
+         (playlistp (alist-get 'entries meta))
+         (fmts (if playlistp (list mpvi-ytdl-default-format) (mpvi-ytdl-pick-formats url)))
+         (title (alist-get 'title meta))
+         (up (or (alist-get 'uploader meta) (alist-get 'series meta)))
          (beg (if (numberp beg) (format " -ss %s" beg)))
          (end (if (numberp end) (format " -to %s" end)))
          (extra (mapconcat (lambda (c) (format " %s" c)) mpvi-ytdl-extra-options " "))
-         (command (string-trim
-                   (minibuffer-with-setup-hook
-                       (lambda ()
-                         (backward-char)
-                         (use-local-map (make-composed-keymap nil (current-local-map)))
-                         (local-set-key (kbd "<return>")
-                                        (lambda ()
-                                          (interactive)
-                                          (let ((cmd (minibuffer-contents)))
-                                            (with-temp-buffer
-                                              (insert cmd)
-                                              (goto-char (point-min))
-                                              (when (re-search-forward " -o +['\"]?\\([^'\"]+\\)" nil t)
-                                                (setq target (match-string 1)))
-                                              (if (file-exists-p target)
-                                                  (message
-                                                   (propertize
-                                                    (format "Output file %s is already exist!" target)
-                                                    'face 'font-lock-warning-face))
-                                                (exit-minibuffer)))))))
-                     (read-string
-                      "Confirm: "
-                      (concat (propertize (concat "yt-dlp " url) 'face 'font-lock-constant-face 'read-only t)
-                              " -f \"" (string-join fmts "+") "\""
-                              (if (or beg end) " --downloader ffmpeg --downloader-args \"ffmpeg_i:")
-                              beg end (if (or beg end) "\"") (if (string-blank-p extra) " " extra)
-                              " -o \"" target "\""))))))
-    (make-directory (file-name-directory target) t) ; ensure directory
-    (setq mpvi-last-save-directory (file-name-directory target)) ; record the dir
-    (with-temp-buffer
-      (mpvi-log "Download/Clip url %s" url)
-      (apply #'mpvi-call-process (split-string-and-unquote command))
-      (if (file-exists-p target)
-          (prog1 target
-            (kill-new target)
-            (message "Save to %s done." (propertize target 'face 'font-lock-keyword-face)))
-        (user-error "Download and clip with yt-dlp/ffmpeg failed: %s" (string-trim (buffer-string)))))))
+         (buffer "*mpvi-ytdl-download*")
+         dir file)
+    (when target
+      (if playlistp
+          (setq dir target)
+        (setq dir (file-name-directory target)
+              file (file-name-nondirectory target))))
+    (unless dir
+      (setq dir mpvi-last-save-directory))
+    (unless file
+      (setq file (concat (if playlistp "%(playlist)s/%(playlist_index)s - ")
+                         "%(title)s_" (string-replace "/" "-or-" (string-join fmts "+"))
+                         ".%(ext)s")))
+    (cl-labels ((down ()
+                  (interactive)
+                  (state "downloading...")
+                  (setq mpvi-last-save-directory dir) ; record the dir
+                  (let ((command (split-string-and-unquote (string-replace "\n" " " (buffer-string)))))
+                    (mpvi-log "Download/Clip %s" url)
+                    (condition-case err
+                        (with-temp-buffer
+                          (apply #'mpvi-call-process command)
+                          (mpvi-log "yt-dlp log: %s" (buffer-string))
+                          (goto-char (point-min))
+                          (if (save-excursion (re-search-forward "has already been downloaded" nil t))
+                              (state "output file is already exist, rename is required!" 'warning)
+                            (if (save-excursion (re-search-forward "^ERROR" nil t))
+                                (progn
+                                  (state "error" 'warning)
+                                  (message "Download and clip with yt-dlp/ffmpeg failed: %s" (string-trim (buffer-string))))
+                              (let ((dest (or (and (re-search-forward "Destination: \\([^ ]+\\)$" nil t)
+                                                   (match-string 1))
+                                              (expand-file-name file dir))))
+                                (quit)
+                                (kill-new dest)
+                                (message "Save to %s done." (propertize dest 'face 'font-lock-keyword-face))))))
+                      (error (state "error" 'warning)
+                             (message "%s" err)))))
+                (link ()
+                  (interactive)
+                  (let ((cmd (string-replace "\n" " " (buffer-string))))
+                    (quit)
+                    (kill-new cmd)
+                    (message "Saved %s to kill ring." (propertize cmd 'face 'font-lock-keyword-face))))
+                (snippet ()
+                  (interactive)
+                  (insert (completing-read
+                           "Insert yt-dlp option: "
+                           (lambda (input pred action)
+                             (if (eq action 'metadata)
+                                 `(metadata (display-sort-function . ,#'identity))
+                               (complete-with-action action mpvi-ytdl-option-tpls input pred))))))
+                (quit ()
+                  (interactive)
+                  (state nil)
+                  (kill-buffer-and-window))
+                (state (s &optional face)
+                  (with-current-buffer (get-buffer buffer)
+                    (setq mpvi-transient-buffer-status
+                          (if s (propertize s 'face (or face 'font-lock-string-face))))
+                    (force-mode-line-update)
+                    (redisplay))))
+      (mpvi-transient-buffer buffer
+        :title (concat "[" up "] " title (if playlistp " (playlist)"))
+        :tips (list (cl-loop for (c . d) in '(("C-c C-c" . "Down")
+                                              ("C-c C-w" . "Link")
+                                              ("C-c C-i" . "Snippet")
+                                              ("C-c C-k" . "Quit"))
+                             concat (concat " " (propertize c 'face 'font-lock-keyword-face) " " d)))
+        :content (concat (propertize (concat "yt-dlp " url) 'face 'font-lock-constant-face 'read-only t 'front-sticky t) "\n"
+                         (format "-f %S\n" (string-join fmts "+"))
+                         (when (or beg end)
+                           (concat "--downloader ffmpeg --downloader-args \"ffmpeg:" beg end "\"\n"))
+                         (unless (string-blank-p extra) (concat extra "\n"))
+                         (format "-P %S\n" dir)
+                         (format "-o %S" file))
+        :onload (lambda ()
+                  (hl-line-mode 1)
+                  (state nil))
+        :keymap (let ((map (make-sparse-keymap)))
+                  (define-key map (kbd "C-c C-c") #'down)
+                  (define-key map (kbd "C-c C-w") #'link)
+                  (define-key map (kbd "C-c C-i") #'snippet)
+                  (define-key map (kbd "C-c C-k") #'quit)
+                  map)
+        :wconfig '((display-buffer-in-direction) (direction . bottom))))))
 
 (defun mpvi-ytdl-download-subtitle (url &optional prefix)
   "Download subtitle for URL and save as file named begin with PREFIX."
